@@ -1,35 +1,68 @@
-from fastapi import FastAPI
 from pydantic import BaseModel
 import sys
+import io
 sys.path.append('third_party/Matcha-TTS')
 from cosyvoice.cli.cosyvoice import CosyVoice2
 from cosyvoice.utils.file_utils import load_wav
 import torchaudio
 import torch
 
+
+# zero_shot
+prompt_speech_16k = load_wav('./asset/eng.wav', 16000)
+cosyvoice2 = CosyVoice2('pretrained_models/CosyVoice2-0.5B', load_jit=False, load_trt=False, fp16=False)
+ref_prompt = "And at the time I thought that so far as he was concerned it was a true story. He told it me with such a direct simplicity of conviction that I could not do otherwise than believe in him."
+
+import torch
+import random
+import numpy as np
+seed = 1234
+random.seed(seed)
+np.random.seed(seed)
+torch.manual_seed(seed)
+torch.cuda.manual_seed_all(seed)
+
+def generate_data(model_output):
+    for i in model_output:
+        tts_audio = (i['tts_speech'].numpy() * (2 ** 15)).astype(np.int16).tobytes()
+        yield tts_audio
+
+from fastapi import FastAPI
+from fastapi.responses import StreamingResponse
 app = FastAPI()
 
-# 初始化模型
-prompt_speech_16k = load_wav('./output/eng.wav', 16000)
-cosyvoice2 = CosyVoice2('pretrained_models/CosyVoice2-0.5B', load_jit=False, load_trt=False, fp16=False)
-
-class TTSRequest(BaseModel):
+class TextToSpeechRequest(BaseModel):
     text: str
-    prompt: str = "Lionel Wallace told me this story of the Door in the Wall. And at the time I thought that so far as he was concerned it was a true story."
 
-@app.post("/tts")
-async def text_to_speech(request: TTSRequest):
+# 请求示例
+"""
+import requests
+import json
+
+url = "http://localhost:8000/zero_shot"
+payload = {
+    "text": "你好,这是一段测试文本。"
+}
+headers = {
+    'Content-Type': 'application/json'
+}
+
+response = requests.post(url, json=payload)
+print(response.json())
+"""
+
+@app.post("/zero_shot")
+def text_to_speech(request: TextToSpeechRequest):
+    text = request.text
+    output = io.BytesIO()
     try:
-        # 执行TTS推理
-        audio_segments = []
-        for segment in cosyvoice2.inference_zero_shot(request.text, request.prompt, prompt_speech_16k, stream=False):
-            audio_segments.append(segment['tts_speech'])
+        # 返回音频文件
+        model_output = cosyvoice2.inference_zero_shot(text, ref_prompt, prompt_speech_16k)
+        audio_data = torch.concat([i['tts_speech'] for i in model_output], dim=1)
+        torchaudio.save(output, audio_data, cosyvoice2.sample_rate, format="wav")
+        output.seek(0)
+        return StreamingResponse(output, media_type="audio/wav")
 
-        # 保存音频文件
-        output_path = "output/generated.wav"
-        torchaudio.save(output_path, audio_segments[0], cosyvoice2.sample_rate)
-
-        return {"status": "success", "message": "Audio generated successfully", "file_path": output_path}
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
